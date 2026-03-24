@@ -8,10 +8,13 @@ Identifies architecture, sections, strings, and cryptographic constants.
 Usage:
     python extract_gsp_firmware.py <firmware.bin> [--output-dir ./output]
     python extract_gsp_firmware.py --scan-system  # Find all installed firmware blobs
+    python extract_gsp_firmware.py <firmware.bin> --format json
 """
 
 import argparse
 import hashlib
+import json
+import math
 import os
 import struct
 import sys
@@ -22,18 +25,6 @@ FIRMWARE_SEARCH_PATHS = [
     "/lib/firmware/nvidia/",
     "/usr/lib/firmware/nvidia/",
     "/usr/share/nvidia/firmware/",
-]
-
-# Known magic bytes for firmware identification
-FALCON_MAGIC = b"\x00\x00\x00\x00"  # Placeholder — needs RE to confirm
-RISCV_MAGIC = b"\x7fELF"  # RISC-V firmware may be ELF-wrapped
-
-# Known GSP firmware filename patterns
-GSP_FIRMWARE_PATTERNS = [
-    "gsp_ga10x.bin",   # Ampere (GA100 series)
-    "gsp_ad10x.bin",   # Ada Lovelace (AD100 series)
-    "gsp_tu10x.bin",   # Turing (TU100 series)
-    "gsp*.bin",        # Catch-all
 ]
 
 # Crypto constants to search for (indicate signing/verification)
@@ -47,6 +38,16 @@ CRYPTO_CONSTANTS = {
         0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76]),
 }
 
+# Falcon microcode header structure (from envytools nv_pfalcon_v2.xml):
+# offset 0x00: OS code offset (u32) — typically 0x100 (boot vector)
+# offset 0x04: OS code size (u32)
+# offset 0x08: OS data offset (u32)
+# offset 0x0c: OS data size (u32)
+# offset 0x10: num apps (u32)
+# The boot vector at 0x100 is a distinguishing feature.
+FALCON_BOOT_VECTOR_OFFSET = 0x100
+FALCON_HEADER_SIZE = 0x14  # Minimum header before app entries
+
 
 def find_system_firmware() -> list[Path]:
     """Scan system paths for NVIDIA GSP firmware blobs."""
@@ -55,7 +56,6 @@ def find_system_firmware() -> list[Path]:
         base = Path(search_path)
         if not base.exists():
             continue
-        # Walk directory tree looking for gsp*.bin files
         for path in base.rglob("gsp*.bin"):
             if path.is_file():
                 found.append(path)
@@ -75,7 +75,6 @@ def identify_architecture(data: bytes) -> str:
     """Attempt to identify the CPU architecture of the firmware blob."""
     # Check for ELF header (RISC-V firmware is often ELF-wrapped)
     if data[:4] == b"\x7fELF":
-        # Parse ELF header for machine type
         if len(data) >= 20:
             e_machine = struct.unpack_from("<H", data, 18)[0]
             arch_map = {
@@ -87,15 +86,19 @@ def identify_architecture(data: bytes) -> str:
             }
             return arch_map.get(e_machine, f"ELF (unknown machine: 0x{e_machine:x})")
 
-    # Check for Falcon microcode header patterns
-    # Falcon code segment starts with a specific header structure
-    # TODO: Confirm Falcon header magic from envytools documentation
-    if len(data) >= 8:
-        word0, word1 = struct.unpack_from("<II", data, 0)
-        # Falcon boot vector is typically at offset 0x100
-        # Header contains code/data segment sizes
-        if word0 < 0x10000 and word1 < 0x10000:
-            return "Possible Falcon (needs confirmation)"
+    # Check for Falcon microcode header patterns (envytools-based heuristic)
+    # Falcon header: os_code_offset, os_code_size, os_data_offset,
+    #                os_data_size, num_apps
+    # os_code_offset is typically 0x100 (the boot vector location)
+    if len(data) >= FALCON_HEADER_SIZE:
+        os_code_off, os_code_sz, os_data_off, os_data_sz, num_apps = \
+            struct.unpack_from("<5I", data, 0)
+        if (os_code_off == FALCON_BOOT_VECTOR_OFFSET
+                and 0 < os_code_sz < len(data)
+                and os_data_off < len(data)
+                and 0 < os_data_sz < len(data)
+                and num_apps < 64):
+            return "Falcon (microcode header detected)"
 
     return "Unknown (needs manual analysis)"
 
@@ -137,7 +140,6 @@ def analyze_sections(data: bytes) -> list[dict]:
     """Attempt to identify code/data sections in the firmware blob."""
     sections = []
 
-    # If it's an ELF, parse sections properly
     if data[:4] == b"\x7fELF":
         try:
             from elftools.elf.elffile import ELFFile
@@ -155,18 +157,15 @@ def analyze_sections(data: bytes) -> list[dict]:
         except Exception as e:
             sections.append({"error": f"ELF parse failed: {e}"})
     else:
-        # For non-ELF blobs, do entropy-based section detection
-        # High entropy = compressed/encrypted, low entropy = code/data
+        # Entropy-based section detection for non-ELF blobs
         chunk_size = 4096
         for i in range(0, len(data), chunk_size):
             chunk = data[i:i + chunk_size]
             if len(chunk) < chunk_size:
                 break
-            # Simple byte frequency entropy estimate
             freq = [0] * 256
             for b in chunk:
                 freq[b] += 1
-            import math
             entropy = -sum(
                 (f / len(chunk)) * math.log2(f / len(chunk))
                 for f in freq if f > 0
@@ -182,78 +181,83 @@ def analyze_sections(data: bytes) -> list[dict]:
     return sections
 
 
-def triage_firmware(filepath: Path, output_dir: Path | None = None):
-    """Perform full triage analysis on a firmware blob."""
-    print(f"\n{'='*70}")
-    print(f"FIRMWARE TRIAGE: {filepath}")
-    print(f"{'='*70}")
+INTERESTING_KEYWORDS = [
+    "boot", "init", "gsp", "falcon", "riscv", "sign", "verify",
+    "hash", "crypt", "key", "cert", "auth", "secur", "dma",
+    "error", "fail", "version", "nvidia", "copyright",
+]
 
+
+def triage_firmware(filepath: Path, min_string_length: int = 10) -> dict:
+    """Perform full triage analysis on a firmware blob. Returns structured results."""
     data = filepath.read_bytes()
 
-    # Basic info
     hashes = compute_hashes(data)
-    print(f"\nSize:   {hashes['size']:,} bytes ({hashes['size'] / 1024 / 1024:.2f} MB)")
-    print(f"MD5:    {hashes['md5']}")
-    print(f"SHA256: {hashes['sha256']}")
-
-    # Architecture
     arch = identify_architecture(data)
-    print(f"\nArchitecture: {arch}")
-
-    # Crypto constants
     crypto = find_crypto_constants(data)
-    if crypto:
+    strings = find_strings(data, min_length=min_string_length)
+    sections = analyze_sections(data)
+
+    interesting_strings = [
+        {"offset": offset, "value": s}
+        for offset, s in strings
+        if any(kw in s.lower() for kw in INTERESTING_KEYWORDS)
+    ]
+
+    return {
+        "file": str(filepath),
+        "size": hashes["size"],
+        "md5": hashes["md5"],
+        "sha256": hashes["sha256"],
+        "architecture": arch,
+        "crypto_constants": [
+            {"name": name, "offset": offset}
+            for name, offset in crypto
+        ],
+        "strings_total": len(strings),
+        "strings_interesting": interesting_strings,
+        "strings_all": [
+            {"offset": offset, "value": s}
+            for offset, s in strings
+        ],
+        "sections": sections,
+    }
+
+
+def print_triage(result: dict):
+    """Print triage results in human-readable format."""
+    print(f"\n{'='*70}")
+    print(f"FIRMWARE TRIAGE: {result['file']}")
+    print(f"{'='*70}")
+
+    print(f"\nSize:   {result['size']:,} bytes ({result['size'] / 1024 / 1024:.2f} MB)")
+    print(f"MD5:    {result['md5']}")
+    print(f"SHA256: {result['sha256']}")
+
+    print(f"\nArchitecture: {result['architecture']}")
+
+    if result["crypto_constants"]:
         print(f"\nCryptographic constants found:")
-        for name, offset in crypto:
-            print(f"  {name} at offset 0x{offset:08x}")
+        for c in result["crypto_constants"]:
+            print(f"  {c['name']} at offset 0x{c['offset']:08x}")
     else:
         print(f"\nNo known crypto constants found (may use custom/obfuscated)")
 
-    # Strings (interesting ones)
-    strings = find_strings(data, min_length=10)
-    interesting_keywords = [
-        "boot", "init", "gsp", "falcon", "riscv", "sign", "verify",
-        "hash", "crypt", "key", "cert", "auth", "secur", "dma",
-        "error", "fail", "version", "nvidia", "copyright",
-    ]
-    print(f"\nTotal strings found: {len(strings)}")
+    print(f"\nTotal strings found: {result['strings_total']}")
     print(f"Interesting strings (keyword matches):")
-    for offset, s in strings:
-        if any(kw in s.lower() for kw in interesting_keywords):
-            print(f"  0x{offset:08x}: {s[:100]}")
+    for s in result["strings_interesting"]:
+        print(f"  0x{s['offset']:08x}: {s['value'][:100]}")
 
-    # Sections
-    sections = analyze_sections(data)
+    sections = result["sections"]
     if sections and "error" not in sections[0]:
         print(f"\nSection analysis:")
-        for s in sections[:20]:  # First 20 only
+        for s in sections[:20]:
             if "name" in s:
                 print(f"  {s['name']:20s} offset=0x{s['offset']:08x} "
                       f"size=0x{s['size']:08x} addr=0x{s['addr']:08x}")
             elif "entropy" in s:
                 print(f"  0x{s['offset']:08x} entropy={s['entropy']:.2f} "
                       f"({s['type']})")
-
-    # Save outputs
-    if output_dir:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        # Save strings
-        strings_file = output_dir / f"{filepath.stem}_strings.txt"
-        with open(strings_file, "w") as f:
-            for offset, s in strings:
-                f.write(f"0x{offset:08x}: {s}\n")
-        print(f"\nStrings saved to: {strings_file}")
-
-        # Save triage summary
-        summary_file = output_dir / f"{filepath.stem}_triage.txt"
-        with open(summary_file, "w") as f:
-            f.write(f"File: {filepath}\n")
-            f.write(f"Size: {hashes['size']}\n")
-            f.write(f"SHA256: {hashes['sha256']}\n")
-            f.write(f"Architecture: {arch}\n")
-            f.write(f"Crypto constants: {len(crypto)}\n")
-            f.write(f"Strings: {len(strings)}\n")
-        print(f"Summary saved to: {summary_file}")
 
     print()
 
@@ -273,28 +277,84 @@ def main():
     parser.add_argument(
         "--min-string-length", type=int, default=10,
         help="Minimum string length for extraction (default: 10)")
+    parser.add_argument(
+        "--format", choices=["text", "json"], default="text",
+        help="Output format (default: text)")
 
     args = parser.parse_args()
 
     if args.scan_system:
-        print("Scanning system for NVIDIA GSP firmware blobs...")
+        print("Scanning system for NVIDIA GSP firmware blobs...",
+              file=sys.stderr if args.format == "json" else sys.stdout)
         found = find_system_firmware()
         if not found:
-            print("No GSP firmware blobs found in standard locations.")
-            print("Try installing NVIDIA drivers or specify path manually.")
+            print("No GSP firmware blobs found in standard locations.",
+                  file=sys.stderr)
+            print("Try installing NVIDIA drivers or specify path manually.",
+                  file=sys.stderr)
             return
-        print(f"Found {len(found)} firmware blob(s):")
+
+        results = []
         for path in found:
-            triage_firmware(path, args.output_dir)
+            result = triage_firmware(path, args.min_string_length)
+            results.append(result)
+            if args.format == "text":
+                print_triage(result)
+
+        if args.format == "json":
+            print(json.dumps(results, indent=2))
+
+        if args.output_dir:
+            args.output_dir.mkdir(parents=True, exist_ok=True)
+            for result in results:
+                _save_outputs(result, args.output_dir, args.format)
 
     elif args.firmware:
         if not args.firmware.exists():
             print(f"Error: {args.firmware} not found", file=sys.stderr)
             sys.exit(1)
-        triage_firmware(args.firmware, args.output_dir)
+
+        result = triage_firmware(args.firmware, args.min_string_length)
+
+        if args.format == "json":
+            print(json.dumps(result, indent=2))
+        else:
+            print_triage(result)
+
+        if args.output_dir:
+            args.output_dir.mkdir(parents=True, exist_ok=True)
+            _save_outputs(result, args.output_dir, args.format)
 
     else:
         parser.print_help()
+
+
+def _save_outputs(result: dict, output_dir: Path, fmt: str):
+    """Save triage outputs to files."""
+    stem = Path(result["file"]).stem
+
+    if fmt == "json":
+        out_file = output_dir / f"{stem}_triage.json"
+        out_file.write_text(json.dumps(result, indent=2))
+        print(f"JSON saved to: {out_file}", file=sys.stderr)
+    else:
+        # Save strings
+        strings_file = output_dir / f"{stem}_strings.txt"
+        with open(strings_file, "w") as f:
+            for s in result["strings_all"]:
+                f.write(f"0x{s['offset']:08x}: {s['value']}\n")
+        print(f"Strings saved to: {strings_file}")
+
+        # Save triage summary
+        summary_file = output_dir / f"{stem}_triage.txt"
+        with open(summary_file, "w") as f:
+            f.write(f"File: {result['file']}\n")
+            f.write(f"Size: {result['size']}\n")
+            f.write(f"SHA256: {result['sha256']}\n")
+            f.write(f"Architecture: {result['architecture']}\n")
+            f.write(f"Crypto constants: {len(result['crypto_constants'])}\n")
+            f.write(f"Strings: {result['strings_total']}\n")
+        print(f"Summary saved to: {summary_file}")
 
 
 if __name__ == "__main__":

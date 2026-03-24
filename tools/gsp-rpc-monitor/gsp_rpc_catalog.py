@@ -39,7 +39,6 @@ class RPCStruct:
     name: str
     source_file: str
     fields: list[dict] = field(default_factory=list)
-    size_bytes: int = 0
 
 
 @dataclass
@@ -265,8 +264,8 @@ def print_catalog(catalog: RPCCatalog):
                 print(f"  // {cmd.comment}")
 
     if catalog.structs:
-        print(f"\n--- RPC Structures ---")
-        for s in catalog.structs[:30]:  # Limit output
+        print(f"\n--- RPC Structures ({len(catalog.structs)} total) ---")
+        for s in catalog.structs:
             print(f"\n{s.name} ({s.source_file}):")
             for f in s.fields:
                 array_suffix = f"[{f['array_size']}]" if "array_size" in f else ""
@@ -274,8 +273,8 @@ def print_catalog(catalog: RPCCatalog):
                 print(f"    {f['type']:<30} {f['name']}{array_suffix}{comment}")
 
     if catalog.enums:
-        print(f"\n--- GSP Enums ---")
-        for e in catalog.enums[:10]:  # Limit output
+        print(f"\n--- GSP Enums ({len(catalog.enums)} total) ---")
+        for e in catalog.enums:
             print(f"\n{e['name']} ({e['source_file']}):")
             for v in e["values"]:
                 print(f"    {v['name']:<50} = {v['value']}")
@@ -304,25 +303,23 @@ def main():
 
     catalog = build_catalog(args.source_path)
 
+    json_data = {
+        "commands": [asdict(c) for c in catalog.commands],
+        "structs": [asdict(s) for s in catalog.structs],
+        "enums": catalog.enums,
+        "source_files": catalog.source_files_parsed,
+    }
+
     if args.format == "json":
-        output = json.dumps(
-            {
-                "commands": [asdict(c) for c in catalog.commands],
-                "structs": [asdict(s) for s in catalog.structs],
-                "enums": catalog.enums,
-                "source_files": catalog.source_files_parsed,
-            },
-            indent=2
-        )
+        output = json.dumps(json_data, indent=2)
         if args.output:
             args.output.write_text(output)
-            print(f"JSON catalog saved to {args.output}")
+            print(f"JSON catalog saved to {args.output}", file=sys.stderr)
         else:
             print(output)
     else:
-        print_catalog(catalog)
         if args.output:
-            # Redirect to file
+            # Write to file via print_catalog with redirected file handle
             import io
             buf = io.StringIO()
             old_stdout = sys.stdout
@@ -331,6 +328,8 @@ def main():
             sys.stdout = old_stdout
             args.output.write_text(buf.getvalue())
             print(f"Catalog saved to {args.output}")
+        else:
+            print_catalog(catalog)
 
 
 if __name__ == "__main__":

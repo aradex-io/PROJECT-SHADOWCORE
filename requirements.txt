@@ -11,7 +11,6 @@ hexdump>=3.3             # Hex dump utilities
 
 # CLI & output
 rich>=13.0               # Terminal output formatting
-click>=8.0               # CLI framework
 
 # Data handling
 pyyaml>=6.0              # Config file parsing

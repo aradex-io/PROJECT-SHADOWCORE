@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for GPU PCI BAR Region Mapper."""
 
+import json
 import sys
 from pathlib import Path
 from unittest import mock
@@ -71,7 +72,6 @@ class TestFindNvidiaGPUs:
         (dev_dir / "device").write_text(device + "\n")
         (dev_dir / "class").write_text(class_id + "\n")
         if add_resource:
-            # BAR0: 16 MB memory, BAR1: 256 MB prefetchable
             (dev_dir / "resource").write_text(
                 "0x00000000f0000000 0x00000000f0ffffff 0x00040200\n"
                 "0x0000000080000000 0x000000008fffffff 0x0014220c\n"
@@ -80,12 +80,6 @@ class TestFindNvidiaGPUs:
 
     def test_detects_nvidia_gpu(self, tmp_path):
         sysfs = self._build_fake_sysfs(tmp_path)
-        with mock.patch("map_gpu_bars.Path") as mock_path_cls:
-            # We need to be more surgical — patch the function directly
-            pass
-
-        # Instead, directly monkeypatch the sysfs root
-        original_fn = bars.find_nvidia_gpus
 
         def patched_find():
             pci_devices = sysfs
@@ -147,21 +141,12 @@ class TestFindNvidiaGPUs:
         assert gpus == []
 
     def test_skips_non_vga_device(self, tmp_path):
-        # Network controller class
         self._build_fake_sysfs(tmp_path, class_id="0x020000")
         dev_path = tmp_path / "0000:01:00.0"
         class_id = int((dev_path / "class").read_text().strip(), 16)
         assert (class_id >> 8) != 0x0300 and (class_id >> 8) != 0x0302
 
     def test_no_sysfs(self):
-        """find_nvidia_gpus returns empty when sysfs doesn't exist."""
-        with mock.patch("map_gpu_bars.Path") as MockPath:
-            MockPath.return_value.exists.return_value = False
-            # The actual function checks Path("/sys/bus/pci/devices")
-            pass
-        # On this test system there's likely no /sys/bus/pci/devices
-        # so the real function should handle it gracefully
-        # Just verify the known_bar_descriptions mapping is sane
         assert 0 in bars.KNOWN_BAR_DESCRIPTIONS
         assert 1 in bars.KNOWN_BAR_DESCRIPTIONS
 
@@ -185,12 +170,12 @@ class TestKnownRegisterRanges:
 
 
 # ---------------------------------------------------------------------------
-# print_gpu_report (smoke test)
+# build_gpu_report / print_gpu_report
 # ---------------------------------------------------------------------------
 
-class TestPrintGPUReport:
-    def test_prints_without_probe(self, capsys):
-        gpu = bars.GPUDevice(
+class TestGPUReport:
+    def _make_gpu(self):
+        return bars.GPUDevice(
             bdf="01:00.0", vendor_id=0x10DE, device_id=0x2684,
             device_name="RTX 4090", driver="nvidia",
             bars=[
@@ -201,10 +186,41 @@ class TestPrintGPUReport:
                 ),
             ],
         )
-        bars.print_gpu_report(gpu, probe=False)
+
+    def test_build_report_structure(self):
+        gpu = self._make_gpu()
+        report = bars.build_gpu_report(gpu, probe=False)
+        assert report["bdf"] == "01:00.0"
+        assert report["device_name"] == "RTX 4090"
+        assert len(report["bars"]) == 1
+        assert report["bars"][0]["index"] == 0
+
+    def test_print_report(self, capsys):
+        gpu = self._make_gpu()
+        report = bars.build_gpu_report(gpu, probe=False)
+        bars.print_gpu_report(report, probe=False)
         out = capsys.readouterr().out
         assert "RTX 4090" in out
         assert "BAR0" in out
+
+    def test_report_json_serializable(self):
+        gpu = self._make_gpu()
+        report = bars.build_gpu_report(gpu, probe=False)
+        output = json.dumps(report, indent=2)
+        parsed = json.loads(output)
+        assert parsed["bdf"] == "01:00.0"
+
+
+# ---------------------------------------------------------------------------
+# --probe-write exits with error
+# ---------------------------------------------------------------------------
+
+class TestProbeWriteBlocked:
+    def test_probe_write_exits(self):
+        with mock.patch("sys.argv", ["map_gpu_bars.py", "--probe-write"]):
+            with pytest.raises(SystemExit) as exc:
+                bars.main()
+            assert exc.value.code == 1
 
 
 # ---------------------------------------------------------------------------

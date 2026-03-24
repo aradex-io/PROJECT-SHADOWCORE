@@ -11,16 +11,18 @@ Requires: root privileges for MMIO access
 Usage:
     sudo python map_gpu_bars.py                    # Auto-detect NVIDIA GPU
     sudo python map_gpu_bars.py --bdf 01:00.0      # Specific device
-    sudo python map_gpu_bars.py --probe-write       # Test write access (CAUTION)
+    sudo python map_gpu_bars.py --probe             # Probe read access (root)
+    sudo python map_gpu_bars.py --format json       # Machine-readable output
 """
 
 import argparse
+import json
 import mmap
 import os
-import re
 import struct
+import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
 
@@ -58,6 +60,9 @@ KNOWN_BAR_DESCRIPTIONS = {
 }
 
 # Known MMIO register ranges within BAR0 (from envytools/rnndb)
+# Note: GSP (0x110000-0x120000) is nested within the FALCON engines block
+# (0x100000-0x200000). Both are listed for completeness — probing will
+# read the GSP sub-range under both labels.
 KNOWN_REGISTER_RANGES = [
     (0x000000, 0x001000, "PMC — Master control"),
     (0x001000, 0x002000, "PBUS — Bus control"),
@@ -71,7 +76,7 @@ KNOWN_REGISTER_RANGES = [
     (0x084000, 0x088000, "PNVIO — I/O pin control"),
     (0x088000, 0x08c000, "PCLOCK — Clock management"),
     (0x100000, 0x200000, "FALCON engines (multiple)"),
-    (0x110000, 0x120000, "GSP — GPU System Processor"),
+    (0x110000, 0x120000, "GSP — GPU System Processor (within FALCON block)"),
     (0x800000, 0x900000, "GPU MMU / page tables"),
     (0xb00000, 0xc00000, "SEC2 — Security engine 2"),
 ]
@@ -112,7 +117,6 @@ def find_nvidia_gpus() -> list[GPUDevice]:
         # Get device name from lspci if available
         device_name = f"NVIDIA GPU (0x{device_id:04x})"
         try:
-            import subprocess
             result = subprocess.run(
                 ["lspci", "-s", dev_path.name, "-nn"],
                 capture_output=True, text=True, timeout=5)
@@ -197,7 +201,7 @@ def probe_bar_read(bar: BARRegion, num_samples: int = 16) -> list[tuple[int, int
         finally:
             os.close(fd)
     except (PermissionError, OSError) as e:
-        print(f"  Warning: Cannot read BAR{bar.index}: {e}")
+        print(f"  Warning: Cannot read BAR{bar.index}: {e}", file=sys.stderr)
 
     return samples
 
@@ -221,7 +225,6 @@ def probe_register_ranges(bar: BARRegion) -> list[dict]:
                 try:
                     mm.seek(start)
                     first_word = struct.unpack("<I", mm.read(4))[0]
-                    # Read a few more words to check if region is populated
                     words = [first_word]
                     for j in range(1, min(4, (end - start) // 4)):
                         words.append(struct.unpack("<I", mm.read(4))[0])
@@ -248,54 +251,93 @@ def probe_register_ranges(bar: BARRegion) -> list[dict]:
         finally:
             os.close(fd)
     except (PermissionError, OSError) as e:
-        print(f"  Warning: Cannot probe registers: {e}")
+        print(f"  Warning: Cannot probe registers: {e}", file=sys.stderr)
 
     return results
 
 
-def print_gpu_report(gpu: GPUDevice, probe: bool = False):
+def build_gpu_report(gpu: GPUDevice, probe: bool = False) -> dict:
+    """Build structured report for a GPU."""
+    report = {
+        "bdf": gpu.bdf,
+        "vendor_id": f"0x{gpu.vendor_id:04x}",
+        "device_id": f"0x{gpu.device_id:04x}",
+        "device_name": gpu.device_name,
+        "driver": gpu.driver,
+        "bars": [],
+        "register_probes": [],
+        "bar_samples": [],
+    }
+
+    for bar in gpu.bars:
+        report["bars"].append({
+            "index": bar.index,
+            "type": bar.bar_type,
+            "physical_addr": f"0x{bar.physical_addr:016x}",
+            "size": bar.size,
+            "size_human": format_size(bar.size),
+            "is_64bit": bar.is_64bit,
+            "is_prefetchable": bar.is_prefetchable,
+            "description": bar.description,
+        })
+
+    if probe and os.geteuid() == 0:
+        for bar in gpu.bars:
+            if bar.index == 0:
+                report["register_probes"] = probe_register_ranges(bar)
+            if bar.bar_type == "memory":
+                samples = probe_bar_read(bar, num_samples=8)
+                if samples:
+                    report["bar_samples"].append({
+                        "bar_index": bar.index,
+                        "description": bar.description[:40],
+                        "samples": [
+                            {"offset": f"0x{off:08x}", "value": f"0x{val:08x}"}
+                            for off, val in samples
+                        ],
+                    })
+
+    return report
+
+
+def print_gpu_report(report: dict, probe: bool = False):
     """Print a detailed report for a GPU."""
     print(f"\n{'='*70}")
-    print(f"GPU: {gpu.device_name}")
+    print(f"GPU: {report['device_name']}")
     print(f"{'='*70}")
-    print(f"BDF:       {gpu.bdf}")
-    print(f"Vendor:    0x{gpu.vendor_id:04x} (NVIDIA)")
-    print(f"Device:    0x{gpu.device_id:04x}")
-    print(f"Driver:    {gpu.driver}")
+    print(f"BDF:       {report['bdf']}")
+    print(f"Vendor:    {report['vendor_id']} (NVIDIA)")
+    print(f"Device:    {report['device_id']}")
+    print(f"Driver:    {report['driver']}")
 
     print(f"\nBAR Regions:")
     print(f"{'BAR':<5} {'Type':<8} {'Physical Address':<20} {'Size':<12} "
           f"{'64bit':<6} {'Prefetch':<9} Description")
     print(f"{'-'*5} {'-'*8} {'-'*20} {'-'*12} {'-'*6} {'-'*9} {'-'*30}")
 
-    for bar in gpu.bars:
-        print(f"BAR{bar.index:<2} {bar.bar_type:<8} 0x{bar.physical_addr:016x} "
-              f"{format_size(bar.size):<12} {'yes' if bar.is_64bit else 'no':<6} "
-              f"{'yes' if bar.is_prefetchable else 'no':<9} {bar.description}")
+    for bar in report["bars"]:
+        print(f"BAR{bar['index']:<2} {bar['type']:<8} {bar['physical_addr']} "
+              f"{bar['size_human']:<12} {'yes' if bar['is_64bit'] else 'no':<6} "
+              f"{'yes' if bar['is_prefetchable'] else 'no':<9} {bar['description']}")
 
-    if probe and os.geteuid() == 0:
+    if report["register_probes"]:
         print(f"\nBAR0 Register Probing:")
-        for bar in gpu.bars:
-            if bar.index == 0:
-                ranges = probe_register_ranges(bar)
-                if ranges:
-                    print(f"{'Range':<22} {'Name':<35} {'Status':<12} Sample")
-                    print(f"{'-'*22} {'-'*35} {'-'*12} {'-'*12}")
-                    for r in ranges:
-                        print(f"{r['range']:<22} {r['name']:<35} "
-                              f"{r['status']:<12} {r['sample']}")
+        print(f"{'Range':<22} {'Name':<35} {'Status':<12} Sample")
+        print(f"{'-'*22} {'-'*35} {'-'*12} {'-'*12}")
+        for r in report["register_probes"]:
+            print(f"{r['range']:<22} {r['name']:<35} "
+                  f"{r['status']:<12} {r['sample']}")
 
+    if report["bar_samples"]:
         print(f"\nBAR Sample Reads:")
-        for bar in gpu.bars:
-            if bar.bar_type == "memory":
-                samples = probe_bar_read(bar, num_samples=8)
-                if samples:
-                    print(f"\n  BAR{bar.index} ({bar.description[:40]}):")
-                    for offset, value in samples:
-                        print(f"    0x{offset:08x}: 0x{value:08x}")
+        for bar_s in report["bar_samples"]:
+            print(f"\n  BAR{bar_s['bar_index']} ({bar_s['description']}):")
+            for s in bar_s["samples"]:
+                print(f"    {s['offset']}: {s['value']}")
 
-    elif probe and os.geteuid() != 0:
-        print(f"\n  [!] Run as root (sudo) to probe BAR regions")
+    if probe and not report["register_probes"] and not report["bar_samples"]:
+        if os.geteuid() != 0:
+            print(f"\n  [!] Run as root (sudo) to probe BAR regions")
 
 
 def main():
@@ -309,7 +351,10 @@ def main():
         help="Probe BAR regions for read access (requires root)")
     parser.add_argument(
         "--probe-write", action="store_true",
-        help="Test write access to BAR regions (CAUTION — requires root)")
+        help="[NOT YET IMPLEMENTED] Test write access to BAR regions")
+    parser.add_argument(
+        "--format", choices=["text", "json"], default="text",
+        help="Output format (default: text)")
     parser.add_argument(
         "--output", "-o", type=Path, default=None,
         help="Save report to file")
@@ -317,27 +362,59 @@ def main():
     args = parser.parse_args()
 
     if args.probe_write:
-        print("WARNING: Write probing can destabilize the GPU or crash the system.")
-        print("Ensure you are using a secondary/test GPU, not your display GPU.")
-        response = input("Continue? [y/N] ")
-        if response.lower() != "y":
-            print("Aborted.")
-            return
+        print("ERROR: --probe-write is not yet implemented.", file=sys.stderr)
+        print("This flag is reserved for Phase 1 when write probing logic",
+              file=sys.stderr)
+        print("has been developed and reviewed. Use --probe for read-only",
+              file=sys.stderr)
+        print("access testing.", file=sys.stderr)
+        sys.exit(1)
 
-    print("Scanning for NVIDIA GPUs...")
+    if args.probe and os.geteuid() != 0:
+        print("Error: --probe requires root privileges (sudo)", file=sys.stderr)
+        sys.exit(1)
+
+    if args.format != "json":
+        print("Scanning for NVIDIA GPUs...")
+
     gpus = find_nvidia_gpus()
 
     if not gpus:
-        print("No NVIDIA GPUs found.")
-        print("Check: lspci | grep -i nvidia")
+        print("No NVIDIA GPUs found.", file=sys.stderr)
+        print("Check: lspci | grep -i nvidia", file=sys.stderr)
         return
 
-    print(f"Found {len(gpus)} NVIDIA GPU(s)")
+    if args.format != "json":
+        print(f"Found {len(gpus)} NVIDIA GPU(s)")
 
+    reports = []
     for gpu in gpus:
         if args.bdf and not gpu.bdf.endswith(args.bdf):
             continue
-        print_gpu_report(gpu, probe=args.probe or args.probe_write)
+        report = build_gpu_report(gpu, probe=args.probe)
+        reports.append(report)
+        if args.format == "text":
+            print_gpu_report(report, probe=args.probe)
+
+    if args.format == "json":
+        output = json.dumps(reports, indent=2)
+        print(output)
+
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        if args.format == "json":
+            args.output.write_text(json.dumps(reports, indent=2))
+        else:
+            # Capture text output to file
+            import io
+            buf = io.StringIO()
+            for report in reports:
+                old_stdout = sys.stdout
+                sys.stdout = buf
+                print_gpu_report(report, probe=args.probe)
+                sys.stdout = old_stdout
+            args.output.write_text(buf.getvalue())
+        print(f"Report saved to: {args.output}", file=sys.stderr)
 
 
 if __name__ == "__main__":

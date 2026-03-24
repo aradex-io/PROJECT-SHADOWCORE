@@ -2,6 +2,7 @@
 """Unit tests for GSP Firmware Extraction & Triage tool."""
 
 import hashlib
+import json
 import math
 import struct
 import sys
@@ -41,8 +42,15 @@ def elf_arm_blob() -> bytes:
 
 @pytest.fixture
 def falcon_like_blob() -> bytes:
-    """Blob that looks like Falcon microcode (two small 32-bit words)."""
-    return struct.pack("<II", 0x0200, 0x0400) + b"\x00" * 56
+    """Blob that matches the Falcon microcode header heuristic.
+
+    Falcon header: os_code_offset=0x100, os_code_size, os_data_offset,
+    os_data_size, num_apps. os_code_offset must be 0x100 (boot vector).
+    """
+    # os_code_offset=0x100, os_code_size=0x400, os_data_offset=0x500,
+    # os_data_size=0x200, num_apps=1
+    # Pad to 2KB so all offset/size fields are < len(data)
+    return struct.pack("<5I", 0x100, 0x400, 0x500, 0x200, 1) + b"\x00" * (2048 - 20)
 
 
 @pytest.fixture
@@ -93,8 +101,13 @@ class TestIdentifyArchitecture:
     def test_falcon_heuristic(self, falcon_like_blob):
         assert "Falcon" in fw.identify_architecture(falcon_like_blob)
 
+    def test_falcon_rejects_wrong_boot_vector(self):
+        """First word must be 0x100 (boot vector offset) for Falcon."""
+        # os_code_offset=0x200 (not 0x100) should NOT match
+        data = struct.pack("<5I", 0x200, 0x400, 0x500, 0x200, 1) + b"\x00" * 44
+        assert "Unknown" in fw.identify_architecture(data)
+
     def test_unknown_blob(self):
-        # Large first words rule out Falcon heuristic
         data = struct.pack("<II", 0xDEADBEEF, 0xCAFEBABE)
         assert "Unknown" in fw.identify_architecture(data)
 
@@ -176,7 +189,6 @@ class TestAnalyzeSections:
         assert sections[0]["entropy"] == 0.0
 
     def test_high_entropy_section(self):
-        # All 256 byte values equally → entropy ≈ 8.0
         data = bytes(range(256)) * 16  # exactly 4096
         sections = fw.analyze_sections(data)
         assert sections[0]["entropy"] >= 7.5
@@ -185,7 +197,7 @@ class TestAnalyzeSections:
     def test_partial_chunk_skipped(self):
         data = b"\x00" * 5000  # one full 4096 chunk + partial
         sections = fw.analyze_sections(data)
-        assert len(sections) == 1  # partial chunk not included
+        assert len(sections) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -199,11 +211,6 @@ class TestFindSystemFirmware:
         (nvidia_dir / "gsp_ad10x.bin").write_bytes(b"\x00")
         (nvidia_dir / "gsp_ga10x.bin").write_bytes(b"\x00")
 
-        with mock.patch.object(fw, "FIRMWARE_SEARCH_PATHS", [str(nvidia_dir.parent)]):
-            # The parent of the nvidia dir is searched, but rglob matches in nvidia/
-            pass
-
-        # Directly patch the constant to point at our tmp dir
         with mock.patch.object(fw, "FIRMWARE_SEARCH_PATHS", [str(nvidia_dir)]):
             found = fw.find_system_firmware()
         assert len(found) == 2
@@ -214,20 +221,61 @@ class TestFindSystemFirmware:
 
 
 # ---------------------------------------------------------------------------
-# triage_firmware (integration: writes output files)
+# triage_firmware (integration: returns structured data)
 # ---------------------------------------------------------------------------
 
 class TestTriageFirmware:
-    def test_writes_output_files(self, firmware_file, tmp_path):
+    def test_returns_structured_result(self, firmware_file):
+        result = fw.triage_firmware(firmware_file)
+        assert "sha256" in result
+        assert "architecture" in result
+        assert "strings_total" in result
+        assert "sections" in result
+        assert result["size"] > 0
+
+    def test_respects_min_string_length(self, firmware_file):
+        result_default = fw.triage_firmware(firmware_file, min_string_length=10)
+        result_short = fw.triage_firmware(firmware_file, min_string_length=4)
+        # Shorter min length should find at least as many strings
+        assert result_short["strings_total"] >= result_default["strings_total"]
+
+    def test_json_serializable(self, firmware_file):
+        result = fw.triage_firmware(firmware_file)
+        # Should not raise
+        output = json.dumps(result, indent=2)
+        parsed = json.loads(output)
+        assert parsed["sha256"] == result["sha256"]
+
+    def test_save_outputs_json(self, firmware_file, tmp_path):
+        result = fw.triage_firmware(firmware_file)
         output_dir = tmp_path / "output"
-        fw.triage_firmware(firmware_file, output_dir)
+        output_dir.mkdir()
+        fw._save_outputs(result, output_dir, "json")
+        json_file = output_dir / f"{firmware_file.stem}_triage.json"
+        assert json_file.exists()
+        data = json.loads(json_file.read_text())
+        assert data["sha256"] == result["sha256"]
+
+    def test_save_outputs_text(self, firmware_file, tmp_path):
+        result = fw.triage_firmware(firmware_file)
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        fw._save_outputs(result, output_dir, "text")
         assert (output_dir / f"{firmware_file.stem}_strings.txt").exists()
         assert (output_dir / f"{firmware_file.stem}_triage.txt").exists()
 
-    def test_no_output_dir(self, firmware_file, capsys):
-        fw.triage_firmware(firmware_file, output_dir=None)
+
+# ---------------------------------------------------------------------------
+# print_triage (smoke test)
+# ---------------------------------------------------------------------------
+
+class TestPrintTriage:
+    def test_prints_report(self, firmware_file, capsys):
+        result = fw.triage_firmware(firmware_file)
+        fw.print_triage(result)
         captured = capsys.readouterr()
         assert "SHA256:" in captured.out
+        assert "Architecture:" in captured.out
 
 
 # ---------------------------------------------------------------------------
@@ -247,3 +295,11 @@ class TestCLI:
             with pytest.raises(SystemExit) as exc_info:
                 fw.main()
             assert exc_info.value.code == 1
+
+    def test_json_format_flag(self, firmware_file, capsys):
+        with mock.patch("sys.argv", ["extract_gsp_firmware.py",
+                                      str(firmware_file), "--format", "json"]):
+            fw.main()
+        out = capsys.readouterr().out
+        data = json.loads(out)
+        assert "sha256" in data

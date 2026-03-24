@@ -40,7 +40,6 @@ class TestBuildPayload:
         before = int(time.time())
         payload = vram.build_test_payload("r")
         after = int(time.time())
-        # Timestamp is after the header: magic + \x00 + name + \x00
         ts_offset = len(vram.MAGIC_HEADER) + 1 + len(b"r") + 1
         ts = struct.unpack_from("<Q", payload, ts_offset)[0]
         assert before <= ts <= after
@@ -52,41 +51,59 @@ class TestBuildPayload:
 
 
 # ---------------------------------------------------------------------------
-# TEST_REGIONS sanity
+# FIXED_TEST_REGIONS sanity
 # ---------------------------------------------------------------------------
 
-class TestRegions:
+class TestFixedRegions:
     def test_five_regions_defined(self):
-        assert len(vram.TEST_REGIONS) == 5
+        assert len(vram.FIXED_TEST_REGIONS) == 5
 
     def test_all_4kb(self):
-        for r in vram.TEST_REGIONS:
+        for r in vram.FIXED_TEST_REGIONS:
             assert r["size"] == 4096
 
     def test_offsets_increase(self):
-        offsets = [r["offset"] for r in vram.TEST_REGIONS]
+        offsets = [r["offset"] for r in vram.FIXED_TEST_REGIONS]
         assert offsets == sorted(offsets)
 
     def test_no_overlap(self):
-        for i in range(len(vram.TEST_REGIONS) - 1):
-            end = vram.TEST_REGIONS[i]["offset"] + vram.TEST_REGIONS[i]["size"]
-            next_start = vram.TEST_REGIONS[i + 1]["offset"]
+        for i in range(len(vram.FIXED_TEST_REGIONS) - 1):
+            end = vram.FIXED_TEST_REGIONS[i]["offset"] + vram.FIXED_TEST_REGIONS[i]["size"]
+            next_start = vram.FIXED_TEST_REGIONS[i + 1]["offset"]
             assert end <= next_start
 
 
 # ---------------------------------------------------------------------------
-# TestResult dataclass
+# build_test_regions (dynamic)
 # ---------------------------------------------------------------------------
 
-class TestTestResult:
-    def test_defaults(self):
-        r = vram.TestResult(
-            region_name="test", offset=0,
-            written=True, survived=None,
-            hash_before="abc", hash_after=None,
-        )
-        assert r.notes == ""
-        assert r.survived is None
+class TestBuildTestRegions:
+    def test_returns_fixed_when_size_zero(self):
+        regions = vram.build_test_regions(0)
+        assert regions == vram.FIXED_TEST_REGIONS
+
+    def test_includes_dynamic_for_large_bar(self):
+        # 1 GB BAR1
+        regions = vram.build_test_regions(1024 * 1024 * 1024)
+        names = [r["name"] for r in regions]
+        # Should have some dynamic regions
+        assert any("quarter" in n or "half" in n or "near_end" in n for n in names)
+
+    def test_skips_regions_beyond_bar_size(self):
+        # 2 MB BAR1 — most fixed regions won't fit
+        regions = vram.build_test_regions(2 * 1024 * 1024)
+        for r in regions:
+            assert r["offset"] + r["size"] <= 2 * 1024 * 1024
+
+    def test_all_regions_page_aligned(self):
+        regions = vram.build_test_regions(512 * 1024 * 1024)
+        for r in regions:
+            assert r["offset"] % 4096 == 0
+
+    def test_sorted_by_offset(self):
+        regions = vram.build_test_regions(256 * 1024 * 1024)
+        offsets = [r["offset"] for r in regions]
+        assert offsets == sorted(offsets)
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +115,6 @@ class TestFindBAR1:
         dev_dir = tmp_path / f"0000:{bdf}"
         dev_dir.mkdir(parents=True)
         (dev_dir / "resource1").write_bytes(b"")
-        # resource file with BAR1 entry at line index 1
         (dev_dir / "resource").write_text(
             "0x00000000f0000000 0x00000000f0ffffff 0x00040200\n"
             "0x0000000080000000 0x000000008fffffff 0x0014220c\n"
@@ -108,7 +124,6 @@ class TestFindBAR1:
     def test_finds_resource1(self, tmp_path):
         sysfs = self._make_sysfs(tmp_path)
         with mock.patch.object(vram, "find_bar1_resource") as mock_fn:
-            # Test the logic manually
             dev_path = sysfs / "0000:01:00.0"
             resource1 = dev_path / "resource1"
             assert resource1.exists()
@@ -131,6 +146,29 @@ class TestFindBAR1:
         end = int(parts[1], 16)
         size = end - start + 1
         assert size == 256 * 1024 * 1024  # 256 MB
+
+
+# ---------------------------------------------------------------------------
+# is_nvidia_driver_loaded / is_nvidia_persistenced_running
+# ---------------------------------------------------------------------------
+
+class TestDriverChecks:
+    def test_driver_loaded_true(self):
+        fake_lsmod = "nvidia 12345 0\nnvidia_uvm 6789 0\n"
+        with mock.patch("subprocess.run") as mock_run:
+            mock_run.return_value = mock.Mock(stdout=fake_lsmod, returncode=0)
+            assert vram.is_nvidia_driver_loaded() is True
+
+    def test_driver_loaded_false(self):
+        fake_lsmod = "snd_hda_intel 12345 0\n"
+        with mock.patch("subprocess.run") as mock_run:
+            mock_run.return_value = mock.Mock(stdout=fake_lsmod, returncode=0)
+            assert vram.is_nvidia_driver_loaded() is False
+
+    def test_persistenced_not_running(self):
+        with mock.patch("subprocess.run") as mock_run:
+            mock_run.return_value = mock.Mock(returncode=1)
+            assert vram.is_nvidia_persistenced_running() is False
 
 
 # ---------------------------------------------------------------------------
