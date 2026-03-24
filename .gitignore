@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Analysis outputs (may contain firmware binaries)
+analysis/firmware-blobs/*.bin
+analysis/ghidra-projects/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+/tmp/
+*.swp
+*.swo
+
+# State files from tools
+/shadowcore_persistence_state.json

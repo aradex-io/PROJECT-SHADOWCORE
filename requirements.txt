@@ -1,0 +1,18 @@
+# SHADOWCORE - GPU Firmware Security Research
+# Phase 0: Reconnaissance tooling dependencies
+
+# Binary analysis
+pycparser>=2.21          # C header parsing for RPC struct extraction
+construct>=2.10          # Binary structure parsing
+capstone>=5.0            # Disassembly engine (multi-arch)
+unicorn>=2.0             # CPU emulation (Falcon/RISC-V)
+pyelftools>=0.29         # ELF parsing for firmware blobs
+hexdump>=3.3             # Hex dump utilities
+
+# CLI & output
+rich>=13.0               # Terminal output formatting
+click>=8.0               # CLI framework
+
+# Data handling
+pyyaml>=6.0              # Config file parsing
+tabulate>=0.9            # Table formatting for reports
